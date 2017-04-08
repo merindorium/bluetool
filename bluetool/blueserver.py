@@ -31,7 +31,10 @@ try:
     from gi.repository import GObject
 except ImportError:
     import gobject as GObject
+from daemon_tree.stream_socket import StreamSvr, StreamCli, SocketError
+from daemon_tree.bridge import IO, DuplexBridge, BridgeIOError
 from bluetool import Bluetooth
+from utils import print_error
 
 
 class SerialPort(object):
@@ -54,9 +57,10 @@ class SerialPort(object):
 
     def initialize(self):
         try:
-            self.manager.RegisterProfile(self.profile_path, self.uuid, self.opts)
+            self.manager.RegisterProfile(
+                self.profile_path, self.uuid, self.opts)
         except dbus.exceptions.DBusException as error:
-            print error
+            print_error(error)
             return False
 
         return True
@@ -68,55 +72,15 @@ class SerialPort(object):
             pass
 
 
-class TCPConnectionError(Exception):
-    pass
-
-
-class TCPServerError(Exception):
-    pass
-
-
-class TCPServer(object):
-
-    def __init__(self, tcp_port, buffer_size=1024):
-        self.server_socket = None
-        self.client_socket = None
-        self.address = ("localhost", tcp_port)
-        self.buffer_size = buffer_size
-
-    def initialize(self):
-        try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(self.address)
-            self.server_socket.listen(5)
-        except socket.error as error:
-            print error
-            return False
-
-        return True
-
-    def accept_connection(self):
-        self.client_socket, client_info = self.server_socket.accept()
-        return client_info
-
-    def kill_connection(self):
-        self.client_socket.close()
-        self.server_socket.close()
-
-    def read(self):
-        return self.client_socket.recv(self.buffer_size)
-
-    def write(self, data):
-        return self.client_socket.send(data)
-
-
 class BluetoothServer(dbus.service.Object):
 
-    def __init__(self, tcp_port=8043, channel=1, tcp_buffer_size=1024, blue_buffer_size=1024):
+    def __init__(
+            self, tcp_port=8043, channel=1,
+            tcp_buffer_size=1024, blue_buffer_size=1024):
         self.spp = SerialPort(channel)
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        dbus.service.Object.__init__(self, dbus.SystemBus(), self.spp.profile_path)
+        dbus.service.Object.__init__(
+            self, dbus.SystemBus(), self.spp.profile_path)
         self.tcp_port = tcp_port
         self.tcp_buffer_size = tcp_buffer_size
         self.blue_buffer_size = blue_buffer_size
@@ -133,7 +97,8 @@ class BluetoothServer(dbus.service.Object):
             return False
 
         if self.server_process is None:
-            self.server_process = multiprocessing.Process(target=self.mainloop.run)
+            self.server_process = multiprocessing.Process(
+                target=self.mainloop.run)
             self.server_process.start()
 
         return True
@@ -148,49 +113,49 @@ class BluetoothServer(dbus.service.Object):
 
         self.spp.deinitialize()
 
-    @dbus.service.method("org.bluez.Profile1", in_signature="oha{sv}", out_signature="")
+    @dbus.service.method(
+        "org.bluez.Profile1", in_signature="oha{sv}", out_signature="")
     def NewConnection(self, path, fd, properties):
         address = str(path)
-        address = address[len(address)-17:len(address)]
+        address = address[len(address) - 17:len(address)]
         address = address.replace("_", ":")
 
-        print "Connected:", address
+        print_error("Connected:", address)
+
+        tcp_svr = StreamSvr("tcp://localhost:{}".format(self.tcp_port))
 
         try:
-            tcp_server = TCPServer(self.tcp_port, self.tcp_buffer_size)
-            if not tcp_server.initialize():
-                raise TCPServerError("TCP server did not start")
+            tcp_svr.initialize()
+            tcp_cli, _ = tcp_svr.accept()
+        except SocketError as error:
+            print_error(error)
+            tcp_svr.close()
+            _disconnect_device(address)
+            return
 
-            print "Waiting for TCPClient..."
-            print "Connected:", tcp_server.accept_connection()
+        blue_sock = socket.fromfd(
+            fd.take(), socket.AF_UNIX, socket.SOCK_STREAM)
+        blue_sock.setblocking(1)
 
-            blue_socket = socket.fromfd(fd.take(), socket.AF_UNIX, socket.SOCK_STREAM)
-            blue_socket.setblocking(1)
+        io1 = IO(
+            tcp_cli, write=tcp_cli.send, read=tcp_cli.recv,
+            read_buffer=self.tcp_buffer_size)
+        io2 = IO(
+            blue_sock, write=blue_sock.send, read=blue_sock.recv,
+            read_buffer=self.blue_buffer_size)
 
-            try:
-                while True:
-                    read, write, error = select.select([tcp_server.client_socket, blue_socket], [], [])
+        bridge = DuplexBridge(input1=io1, input2=io2)
 
-                    for sock in read:
-                        if sock == tcp_server.client_socket:
-                            data = tcp_server.read()
-                            if not data:
-                                raise TCPConnectionError("External connection shutdown")
-                            blue_socket.send(data)
+        try:
+            bridge.run()
+        except BridgeIOError as error:
+            print_error(error)
 
-                        if sock == blue_socket:
-                            data = blue_socket.recv(self.blue_buffer_size)
-                            if data:
-                                tcp_server.write(data)
-            except IOError as error:
-                print error
-            except TCPConnectionError as error:
-                print error
+        tcp_cli.close()
+        tcp_svr.close()
+        blue_sock.close()
+        _disconnect_device(address)
 
-            blue_socket.close()
-            tcp_server.kill_connection()
-        except TCPServerError as error:
-            print error
 
-        bluetooth = Bluetooth()
-        bluetooth.disconnect(address)
+def _disconnect_device(address):
+    Bluetooth().disconnect(address)
